@@ -3,7 +3,7 @@ import os
 import sys
 import time
 import dotenv
-from sqlalchemy import create_engine, Column, String, DateTime, MetaData, Table, inspect, text
+from sqlalchemy import create_engine, Column, String, DateTime, MetaData, Table, inspect, text, Integer, Text, ForeignKey
 from sqlalchemy.sql import func
 import psycopg2
 from psycopg2 import sql
@@ -95,6 +95,26 @@ try:
         Column('upload_date', DateTime, server_default=func.now())
     )
     
+    # Define conversations table
+    conversations_table = Table(
+        'conversations', metadata,
+        Column('id', Integer, primary_key=True),
+        Column('title', String),
+        Column('system_prompt', Text),
+        Column('created_at', DateTime, server_default=func.now()),
+        Column('updated_at', DateTime, server_default=func.now(), onupdate=func.now())
+    )
+    
+    # Define messages table
+    messages_table = Table(
+        'messages', metadata,
+        Column('id', Integer, primary_key=True),
+        Column('conversation_id', Integer, ForeignKey('conversations.id', ondelete='CASCADE')),
+        Column('role', String, nullable=False),
+        Column('content', Text, nullable=False),
+        Column('created_at', DateTime, server_default=func.now())
+    )
+    
     # Create tables
     metadata.create_all(engine)
     print("✅ Tables created successfully")
@@ -107,6 +127,14 @@ try:
     if 'documents' in tables:
         columns = [col['name'] for col in inspector.get_columns('documents')]
         print(f"Columns in 'documents' table: {', '.join(columns)}")
+    
+    if 'conversations' in tables:
+        columns = [col['name'] for col in inspector.get_columns('conversations')]
+        print(f"Columns in 'conversations' table: {', '.join(columns)}")
+    
+    if 'messages' in tables:
+        columns = [col['name'] for col in inspector.get_columns('messages')]
+        print(f"Columns in 'messages' table: {', '.join(columns)}")
     
 except Exception as e:
     print(f"❌ Error creating tables: {str(e)}")

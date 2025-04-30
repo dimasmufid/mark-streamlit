@@ -17,8 +17,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from minio import Minio
 from minio.error import S3Error
-from sqlalchemy import create_engine, Column, String, DateTime, MetaData, Table, select, insert, delete, update
-from sqlalchemy.sql import func
+from sqlalchemy import create_engine, Column, String, DateTime, MetaData, Table, select, insert, delete, update, Integer, Text, ForeignKey
+from sqlalchemy.sql import func, text
 import psycopg2
 import time
 import re
@@ -146,6 +146,26 @@ class StorageConfig:
                 Column('upload_date', DateTime, server_default=func.now())
             )
             
+            # Define conversations table
+            self.conversations_table = Table(
+                'conversations', self.metadata,
+                Column('id', Integer, primary_key=True),
+                Column('title', String),
+                Column('system_prompt', Text),
+                Column('created_at', DateTime, server_default=func.now()),
+                Column('updated_at', DateTime, server_default=func.now(), onupdate=func.now())
+            )
+            
+            # Define messages table
+            self.messages_table = Table(
+                'messages', self.metadata,
+                Column('id', Integer, primary_key=True),
+                Column('conversation_id', Integer, ForeignKey('conversations.id', ondelete='CASCADE')),
+                Column('role', String, nullable=False),
+                Column('content', Text, nullable=False),
+                Column('created_at', DateTime, server_default=func.now())
+            )
+            
             # Create tables if they don't exist
             self.metadata.create_all(self.engine)
             self.db_ready = True
@@ -267,6 +287,145 @@ class StorageConfig:
             return temp_path
         except Exception as e:
             return f"Error retrieving document: {str(e)}"
+    
+    # Conversation Management Methods
+    def get_all_conversations(self):
+        """Get all conversations from the database"""
+        if not self.db_ready:
+            return {}
+        
+        try:
+            conversations = {}
+            with self.engine.begin() as conn:
+                stmt = select(self.conversations_table)
+                results = conn.execute(stmt).fetchall()
+                
+                for row in results:
+                    conversations[row.id] = {
+                        "id": row.id,
+                        "title": row.title or f"Conversation {row.id}",
+                        "system_prompt": row.system_prompt,
+                        "created_at": row.created_at.strftime("%Y-%m-%d %H:%M:%S") if row.created_at else None,
+                        "updated_at": row.updated_at.strftime("%Y-%m-%d %H:%M:%S") if row.updated_at else None,
+                        "messages": []
+                    }
+            
+            return conversations
+        except Exception as e:
+            st.error(f"Error fetching conversations: {str(e)}")
+            return {}
+    
+    def get_conversation_messages(self, conversation_id):
+        """Get all messages for a specific conversation"""
+        if not self.db_ready:
+            return []
+        
+        try:
+            messages = []
+            with self.engine.begin() as conn:
+                stmt = select(self.messages_table).where(
+                    self.messages_table.c.conversation_id == conversation_id
+                ).order_by(self.messages_table.c.id)
+                
+                results = conn.execute(stmt).fetchall()
+                
+                for row in results:
+                    messages.append({
+                        "role": row.role,
+                        "content": row.content
+                    })
+            
+            return messages
+        except Exception as e:
+            st.error(f"Error fetching messages: {str(e)}")
+            return []
+    
+    def create_conversation(self, system_prompt=None, title=None):
+        """Create a new conversation"""
+        if not self.db_ready:
+            return None, "Database is not available"
+        
+        try:
+            with self.engine.begin() as conn:
+                stmt = insert(self.conversations_table).values(
+                    system_prompt=system_prompt,
+                    title=title,
+                    created_at=datetime.now(),
+                    updated_at=datetime.now()
+                )
+                result = conn.execute(stmt)
+                
+                # Get the last inserted ID
+                stmt = text("SELECT lastval()")
+                last_id = conn.execute(stmt).scalar()
+                
+                return last_id, None
+        except Exception as e:
+            return None, f"Error creating conversation: {str(e)}"
+    
+    def add_message(self, conversation_id, role, content):
+        """Add a message to a conversation"""
+        if not self.db_ready:
+            return False, "Database is not available"
+        
+        try:
+            with self.engine.begin() as conn:
+                # Add message
+                stmt = insert(self.messages_table).values(
+                    conversation_id=conversation_id,
+                    role=role,
+                    content=content,
+                    created_at=datetime.now()
+                )
+                conn.execute(stmt)
+                
+                # Update conversation's updated_at timestamp
+                stmt = update(self.conversations_table).where(
+                    self.conversations_table.c.id == conversation_id
+                ).values(
+                    updated_at=datetime.now()
+                )
+                conn.execute(stmt)
+                
+                return True, None
+        except Exception as e:
+            return False, f"Error adding message: {str(e)}"
+    
+    def delete_conversation(self, conversation_id):
+        """Delete a conversation and all its messages"""
+        if not self.db_ready:
+            return False, "Database is not available"
+        
+        try:
+            with self.engine.begin() as conn:
+                # Messages will be cascade deleted due to foreign key constraint
+                stmt = delete(self.conversations_table).where(
+                    self.conversations_table.c.id == conversation_id
+                )
+                conn.execute(stmt)
+                
+                return True, None
+        except Exception as e:
+            return False, f"Error deleting conversation: {str(e)}"
+            
+    def update_conversation_system_prompt(self, conversation_id, system_prompt):
+        """Update a conversation's system prompt"""
+        if not self.db_ready:
+            return False, "Database is not available"
+        
+        try:
+            with self.engine.begin() as conn:
+                stmt = update(self.conversations_table).where(
+                    self.conversations_table.c.id == conversation_id
+                ).values(
+                    system_prompt=system_prompt,
+                    updated_at=datetime.now()
+                )
+                conn.execute(stmt)
+                
+                return True, None
+        except Exception as e:
+            return False, f"Error updating system prompt: {str(e)}"
 
 # File processing functions
 def extract_text_from_pdf(file):
@@ -427,10 +586,7 @@ client = OpenAI(api_key=api_key)
 # Initialize storage configuration
 storage_config = StorageConfig()
 
-# Initialize session state for conversations and documents
-if "conversations" not in st.session_state:
-    st.session_state.conversations = {}
-
+# Initialize session state for current conversation
 if "current_conversation_id" not in st.session_state:
     st.session_state.current_conversation_id = 0
 
@@ -439,6 +595,21 @@ if "analysis_results" not in st.session_state:
 
 # Load documents from PostgreSQL
 st.session_state.documents = storage_config.get_all_documents()
+
+# Load conversations from PostgreSQL
+conversations = storage_config.get_all_conversations()
+
+# If there are no conversations in the database but current_conversation_id is set, create a new one
+if not conversations and st.session_state.current_conversation_id == 0:
+    # Create a default conversation
+    conv_id, error = storage_config.create_conversation(
+        system_prompt=DEFAULT_SYSTEM_PROMPT, 
+        title="New Conversation"
+    )
+    if error:
+        st.error(f"Error creating default conversation: {error}")
+    else:
+        st.session_state.current_conversation_id = conv_id
 
 # Function to generate Python code for data analysis
 def generate_analysis_code(user_query, available_files):
@@ -511,13 +682,27 @@ with st.sidebar:
     sidebar_tab = st.radio("Sidebar Options", ["System Prompt", "Documents", "Conversations"])
     
     if sidebar_tab == "System Prompt":
+        # Get current conversation from database
+        conversations = storage_config.get_all_conversations()
+        curr_conv_id = st.session_state.current_conversation_id
+        current_conv = next((conv for conv_id, conv in conversations.items() if conv_id == curr_conv_id), None)
+        
         # System prompt input
+        current_prompt = current_conv.get('system_prompt', DEFAULT_SYSTEM_PROMPT) if current_conv else DEFAULT_SYSTEM_PROMPT
         system_prompt = st.text_area(
             "System Prompt",
-            value=st.session_state.get("system_prompt", DEFAULT_SYSTEM_PROMPT),
+            value=current_prompt,
             height=150
         )
-        st.session_state.system_prompt = system_prompt
+        
+        # Save system prompt to database
+        if system_prompt != current_prompt and curr_conv_id:
+            if st.button("Update System Prompt"):
+                success, error = storage_config.update_conversation_system_prompt(curr_conv_id, system_prompt)
+                if error:
+                    st.error(error)
+                else:
+                    st.success("System prompt updated successfully")
         
         # Save current system prompt as a preset
         preset_name = st.text_input("Preset Name")
@@ -531,8 +716,14 @@ with st.sidebar:
         if "presets" in st.session_state and st.session_state.presets:
             selected_preset = st.selectbox("Load Preset", options=list(st.session_state.presets.keys()))
             if st.button("Load"):
-                st.session_state.system_prompt = st.session_state.presets[selected_preset]
-                st.rerun()
+                preset_prompt = st.session_state.presets[selected_preset]
+                if curr_conv_id:
+                    success, error = storage_config.update_conversation_system_prompt(curr_conv_id, preset_prompt)
+                    if error:
+                        st.error(error)
+                    else:
+                        st.success("System prompt updated from preset")
+                        st.rerun()
     
     elif sidebar_tab == "Documents":
         if not storage_config.minio_ready or not storage_config.db_ready:
@@ -594,16 +785,45 @@ with st.sidebar:
     elif sidebar_tab == "Conversations":
         # New conversation button
         if st.button("New Conversation"):
-            st.session_state.current_conversation_id = max(list(st.session_state.conversations.keys()) + [0]) + 1
-            st.session_state.conversations[st.session_state.current_conversation_id] = []
-            st.rerun()
+            conv_id, error = storage_config.create_conversation(
+                system_prompt=DEFAULT_SYSTEM_PROMPT, 
+                title=f"Conversation {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            )
+            if error:
+                st.error(error)
+            else:
+                st.session_state.current_conversation_id = conv_id
+                st.rerun()
         
         # Existing conversations
         st.subheader("Conversations")
-        for conv_id in sorted(st.session_state.conversations.keys(), reverse=True):
-            if st.button(f"Conversation {conv_id}", key=f"btn_conv_{conv_id}"):
-                st.session_state.current_conversation_id = conv_id
-                st.rerun()
+        # Get updated list of conversations
+        conversations = storage_config.get_all_conversations()
+        for conv_id, conv in sorted(conversations.items(), key=lambda x: x[0], reverse=True):
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                if st.button(f"{conv['title']}", key=f"btn_conv_{conv_id}"):
+                    st.session_state.current_conversation_id = conv_id
+                    st.rerun()
+            with col2:
+                if st.button("🗑️", key=f"del_conv_{conv_id}"):
+                    success, error = storage_config.delete_conversation(conv_id)
+                    if error:
+                        st.error(error)
+                    else:
+                        # If we deleted the current conversation, set current to first available
+                        if st.session_state.current_conversation_id == conv_id:
+                            remaining_convs = storage_config.get_all_conversations()
+                            if remaining_convs:
+                                st.session_state.current_conversation_id = next(iter(remaining_convs.keys()))
+                            else:
+                                # Create a new conversation if none left
+                                new_id, _ = storage_config.create_conversation(
+                                    system_prompt=DEFAULT_SYSTEM_PROMPT, 
+                                    title="New Conversation"
+                                )
+                                st.session_state.current_conversation_id = new_id
+                        st.rerun()
 
 # Main chat area
 st.title("Chat")
@@ -633,15 +853,36 @@ else:
     selected_doc_data = []
     analysis_mode = "Use Document Content Directly"  # Default
 
-# Ensure the current conversation exists
+# Get current conversation ID
 current_id = st.session_state.current_conversation_id
-if current_id not in st.session_state.conversations:
-    st.session_state.conversations[current_id] = []
+
+# Get conversation and messages from the database
+conversations = storage_config.get_all_conversations()
+current_conv = next((conv for conv_id, conv in conversations.items() if conv_id == current_id), None)
+
+if not current_conv:
+    # Create a new conversation if the current one doesn't exist
+    conv_id, error = storage_config.create_conversation(
+        system_prompt=DEFAULT_SYSTEM_PROMPT, 
+        title="New Conversation"
+    )
+    if error:
+        st.error(f"Error creating conversation: {error}")
+    else:
+        st.session_state.current_conversation_id = conv_id
+        current_id = conv_id
+        st.rerun()
+
+# Get messages for current conversation
+messages = storage_config.get_conversation_messages(current_id)
 
 # Display messages
-for message in st.session_state.conversations[current_id]:
+for message in messages:
     with st.chat_message(message["role"]):
         st.write(message["content"])
+
+# Get the current system prompt
+system_prompt = current_conv.get('system_prompt', DEFAULT_SYSTEM_PROMPT) if current_conv else DEFAULT_SYSTEM_PROMPT
 
 # Chat input
 prompt = st.chat_input("Type your message here...")
@@ -650,8 +891,10 @@ if prompt:
     with st.chat_message("user"):
         st.write(prompt)
     
-    # Add to conversation history
-    st.session_state.conversations[current_id].append({"role": "user", "content": prompt})
+    # Add to conversation history in the database
+    success, error = storage_config.add_message(current_id, "user", prompt)
+    if error:
+        st.error(f"Error saving message: {error}")
     
     # Reset analysis results
     st.session_state.analysis_results = {}
@@ -680,11 +923,14 @@ if prompt:
     # Generate and display assistant response
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
+            # Get the updated messages for the prompt context
+            messages = storage_config.get_conversation_messages(current_id)
+            
             if analysis_mode == "Generate Python Code":
                 # Pass analysis results to the model
                 response = generate_response(
                     system_prompt, 
-                    st.session_state.conversations[current_id],
+                    messages,
                     st.session_state.analysis_results
                 )
             else:
@@ -725,14 +971,16 @@ if prompt:
                 
                 response = generate_response(
                     system_prompt, 
-                    st.session_state.conversations[current_id],
+                    messages,
                     {"result": "\n\n".join([f"--- {doc['name']} ---\n{doc['content']}" for doc in doc_content])} if doc_content else None
                 )
             
             st.write(response)
     
-    # Add assistant response to conversation history
-    st.session_state.conversations[current_id].append({"role": "assistant", "content": response})
+    # Add assistant response to conversation history in the database
+    success, error = storage_config.add_message(current_id, "assistant", response)
+    if error:
+        st.error(f"Error saving response: {error}")
 
 # Display conversation metadata
-st.caption(f"Current conversation: {current_id}")
+st.caption(f"Current conversation: {current_id} - {current_conv.get('title', 'Untitled')}")
